@@ -2,10 +2,12 @@
 
 Two modes, one code path:
 
-  --staged (default)   `git diff --cached -U0`. The pre-commit hook. Runs before
-                       the commit enters git history, which is the whole point:
-                       once a secret is committed and pushed it must be rotated
-                       even if the commit is later deleted.
+  (no arguments)       `git diff --cached -U0`, the staged changes. The
+                       pre-commit hook, and the default. Runs before the commit
+                       enters git history, which is the whole point: once a
+                       secret is committed and pushed it must be rotated even if
+                       the commit is later deleted. There is no `--staged` flag;
+                       staged is simply what you get without `--rev-range`.
   --rev-range A..B     `git diff A..B -U0`. The CI mode used by the GitHub
                        Action, the GitLab CI component and the CircleCI orb.
                        Strictly a backstop — by the time CI runs, the secret is
@@ -40,6 +42,7 @@ Exit codes:
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import hashlib
 import json
 import os
@@ -47,6 +50,8 @@ import platform
 import re
 import subprocess
 import sys
+import urllib.error
+import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 
@@ -61,6 +66,11 @@ SEVERITY_ORDER = ["LOW", "MEDIUM", "HIGH", "CRITICAL"]
 # Where a developer is sent to check what is ALREADY public. The local hook can
 # only prevent the next leak; it cannot see what has already been scraped.
 EXPOSURE_URL = "https://api.relayshield.net/developers?source=rsscan"
+# --deps gets its own key. Both are registered, but they land on different
+# banners on purpose: someone whose commit was just blocked is asking whether
+# their org's credentials are already public, and someone who just counted 275
+# publisher accounts in their dependency tree is asking a different question.
+DEPS_EXPOSURE_URL = "https://api.relayshield.net/developers?source=rsscan-deps"
 
 _RED = "\033[31m"
 _YELLOW = "\033[33m"
@@ -235,6 +245,21 @@ def _install_id() -> str:
     return hashlib.sha256(raw.encode("utf-8", "replace")).hexdigest()[:16]
 
 
+# Free/consumer mail domains, used by --deps to count how many publisher
+# accounts sit on personal webmail rather than on an organisation's domain.
+#
+# That count is the point of the whole subcommand: a personal Gmail account with
+# npm publish rights has no SSO, no central revocation and no IT department, so
+# it is the account a stealer log actually monetises. This is a signal about the
+# dependency, not a judgement about the person.
+_PERSONAL_EMAIL_DOMAINS = frozenset({
+    "gmail.com", "googlemail.com", "outlook.com", "hotmail.com", "live.com",
+    "yahoo.com", "icloud.com", "me.com", "mac.com", "proton.me", "protonmail.com",
+    "pm.me", "aol.com", "gmx.com", "gmx.de", "yandex.ru", "mail.com",
+    "zoho.com", "fastmail.com", "hey.com", "duck.com", "users.noreply.github.com",
+})
+
+
 def _send_org_signal(org: str, counts: dict, endpoint: str, timeout: int) -> None:
     """Report that this org uses rsscan. Aggregate counts only, opt-in only.
 
@@ -365,6 +390,24 @@ def _report(findings: list[dict], blocking: list[dict], where: str, staged: bool
         if staged:
             print(file=sys.stderr)
             print(_colour("  To bypass entirely: git commit --no-verify", _DIM), file=sys.stderr)
+        print(file=sys.stderr)
+
+    # The limit of what a local scanner can honestly claim. Everything above is
+    # a leak that has been PREVENTED. rsscan reads a diff, so it is structurally
+    # incapable of seeing a credential that already left: committed last year,
+    # published in a package, baked into an image. That question needs a search
+    # of public artifacts, which is a different job and a paid one.
+    #
+    # Printed only when something was found, which is the one moment the reader
+    # is already thinking about leaked credentials. Printing it on every clean
+    # run would train people to skip the block, the same reasoning the delivery
+    # channels use for staying quiet on clean builds.
+    if findings:
+        print(_colour("  What this scan could NOT see", _BOLD), file=sys.stderr)
+        print("  rsscan reads your diff, so it catches what is about to leak. It cannot see", file=sys.stderr)
+        print("  a credential that already left: committed months ago, shipped in a package,", file=sys.stderr)
+        print("  or baked into an image, and possibly indexed and scraped since.", file=sys.stderr)
+        print(f"  Check what is already public: {EXPOSURE_URL}", file=sys.stderr)
         print(file=sys.stderr)
 
 
@@ -576,6 +619,245 @@ def _annotations_enabled(mode: str) -> bool:
     return os.environ.get("GITHUB_ACTIONS", "").strip().lower() == "true"
 
 
+# ---------------------------------------------------------------------------
+# --deps: who can publish your dependencies
+#
+# Every package security tool analyses the artefact. None of them can tell you
+# anything about the humans who hold publish rights on it, which is where the
+# self-replicating npm worms actually enter: not through malicious code in a
+# release, but through a maintainer account that someone else is now using.
+#
+# This subcommand counts those accounts and stops there. It does NOT screen them
+# against anything, it names nobody, and it sends nothing to RelayShield. The
+# only network calls are to registry.npmjs.org, and the only output is
+# arithmetic over public registry metadata.
+#
+# It closes on what it cannot see -- whether any of those accounts are actually
+# compromised right now -- which is the same construction --report uses.
+# ---------------------------------------------------------------------------
+
+# The version document, not the full package document. Three URLs are possible
+# here and two of them are wrong:
+#
+#   /<pkg>          the full document: every version ever published. 11 MB for
+#                   @types/node. Resolving 400 packages this way moves gigabytes.
+#   /<pkg>/latest   3.7 KB, and carries both `maintainers` and `_npmUser`.
+#   the abbreviated `application/vnd.npm.install-v1+json` document omits
+#                   `maintainers` ENTIRELY, so it returns zero publishers for
+#                   every package while looking like it worked. Never use it.
+NPM_REGISTRY_URL = "https://registry.npmjs.org/{package}/latest"
+
+# Mirrors the server-side rule in relayshield_api.py so a package name that
+# resolves here resolves there. Registry names are lowercase, optionally scoped.
+_NPM_PACKAGE_RE = re.compile(r"^(?:@[a-z0-9][a-z0-9._-]*/)?[a-z0-9][a-z0-9._-]{0,213}$")
+
+# Shared and automated addresses. `security@`, `oss-bot@`, `release-ci@`. These
+# are counted separately rather than dropped: a role address is a real publish
+# path, but it is a mailing list or a CI robot, so "is this person's laptop
+# infected" is not a question that can be asked about it.
+_ROLE_ADDRESS_LOCALPARTS = frozenset({
+    "admin", "abuse", "bot", "ci", "contact", "dev", "devs", "developer",
+    "developers", "help", "hello", "hi", "info", "it", "mail", "maintainer",
+    "maintainers", "noreply", "no-reply", "npm", "ops", "oss", "oss-bot",
+    "packages", "postmaster", "release", "releases", "root", "security",
+    "support", "sysadmin", "team", "webmaster",
+})
+
+_MANIFEST_CANDIDATES = ("package-lock.json", "package.json")
+
+# Polite concurrency against a public registry that owes us nothing. Eight
+# workers resolves a 400-package manifest in well under a minute; more than that
+# risks looking like abuse for no real gain.
+_DEPS_WORKERS = 8
+
+
+def _is_role_address(email: str) -> bool:
+    local = email.split("@", 1)[0].lower()
+    if local in _ROLE_ADDRESS_LOCALPARTS:
+        return True
+    # `oss-bot`, `npm-publish`, `release-ci` and friends.
+    return any(local.startswith(p + "-") or local.endswith("-" + p)
+               for p in ("bot", "ci", "oss", "npm", "release", "noreply"))
+
+
+def _is_personal_email(email: str) -> bool:
+    domain = email.rsplit("@", 1)[-1].strip().lower()
+    return domain in _PERSONAL_EMAIL_DOMAINS
+
+
+def _packages_from_manifest(manifest) -> list[str]:
+    """Accept package.json or package-lock.json, as an object or a JSON string.
+
+    A lockfile gives the full transitive tree, which is the number that matters:
+    the worm does not care whether you declared the dependency yourself.
+    """
+    if isinstance(manifest, str):
+        try:
+            manifest = json.loads(manifest)
+        except Exception:
+            return []
+    if not isinstance(manifest, dict):
+        return []
+
+    names: set[str] = set()
+    # package.json
+    for section in ("dependencies", "devDependencies", "peerDependencies", "optionalDependencies"):
+        block = manifest.get(section)
+        if isinstance(block, dict):
+            names.update(k for k in block if isinstance(k, str))
+    # package-lock.json v2/v3: keys look like "node_modules/left-pad"
+    packages = manifest.get("packages")
+    if isinstance(packages, dict):
+        for key in packages:
+            if isinstance(key, str) and "node_modules/" in key:
+                names.add(key.rsplit("node_modules/", 1)[1])
+    # package-lock.json v1
+    deps = manifest.get("dependencies")
+    if isinstance(deps, dict) and any(isinstance(v, dict) and "version" in v for v in deps.values()):
+        names.update(k for k in deps if isinstance(k, str))
+
+    return sorted(n for n in names if n and not n.startswith("."))
+
+
+def _npm_maintainer_emails(package: str, timeout: int = 10) -> tuple[list[str], str | None]:
+    """Resolve a package to its publisher emails. Returns (emails, error).
+
+    An error is returned rather than an empty list, because "we could not ask"
+    and "nobody can publish this" must never collapse into the same answer. The
+    caller counts unresolved packages and prints that count, which is the
+    difference between a report and a false clean.
+    """
+    if not _NPM_PACKAGE_RE.match(package):
+        return [], "invalid_package_name"
+    url = NPM_REGISTRY_URL.format(package=urllib.parse.quote(package, safe="@/"))
+    req = urllib.request.Request(url, headers={
+        "User-Agent": f"rsscan/{_VERSION} (+https://github.com/RelayShield/rsscan)",
+        "Accept": "application/json",
+    })
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            doc = json.loads(resp.read())
+    except urllib.error.HTTPError as exc:
+        return [], ("not_found" if exc.code == 404 else f"registry_http_{exc.code}")
+    except Exception:
+        return [], "registry_unreachable"
+
+    emails: list[str] = []
+    for m in (doc.get("maintainers") or []):
+        if isinstance(m, dict):
+            e = (m.get("email") or "").strip().lower()
+            if e and "@" in e:
+                emails.append(e)
+    # `_npmUser` is the account that actually published the version you have
+    # installed, whereas `maintainers` lists everyone who merely could have.
+    # Counted, never distinguished in the output.
+    npm_user = ((doc.get("_npmUser") or {}).get("email") or "").strip().lower()
+    if npm_user and "@" in npm_user:
+        emails.append(npm_user)
+    return sorted(set(emails)), (None if emails else "no_maintainer_email")
+
+
+def _find_manifest(path: str) -> tuple[str, str]:
+    """Resolve the manifest to (path, raw_text). Raises OSError if unreadable."""
+    if path:
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            return path, fh.read()
+    for candidate in _MANIFEST_CANDIDATES:
+        if os.path.isfile(candidate):
+            with open(candidate, "r", encoding="utf-8", errors="replace") as fh:
+                return candidate, fh.read()
+    raise FileNotFoundError(
+        f"no manifest found. Looked for {' then '.join(_MANIFEST_CANDIDATES)} "
+        f"in {os.getcwd()}. Pass a path: rsscan --deps path/to/package-lock.json"
+    )
+
+
+def _run_deps(path: str, timeout: int) -> int:
+    """Count the publisher accounts behind a dependency manifest."""
+    try:
+        manifest_path, raw = _find_manifest(path)
+    except OSError as exc:
+        print(_colour(f"rsscan --deps: {exc}", _RED), file=sys.stderr)
+        return 1
+
+    packages = _packages_from_manifest(raw)
+    if not packages:
+        print(
+            _colour(
+                f"rsscan --deps: no dependencies found in {manifest_path}. "
+                f"If this is a package.json with no dependency sections, that is "
+                f"the correct answer.",
+                _DIM,
+            ),
+            file=sys.stderr,
+        )
+        return 0
+
+    print(
+        _colour(f"  Resolving publishers for {len(packages):,} packages "
+                f"from {manifest_path}...", _DIM),
+        file=sys.stderr,
+    )
+
+    emails: set[str] = set()
+    unresolved: dict[str, str] = {}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=_DEPS_WORKERS) as pool:
+        futures = {
+            pool.submit(_npm_maintainer_emails, pkg, timeout): pkg
+            for pkg in packages
+        }
+        for future in concurrent.futures.as_completed(futures):
+            pkg = futures[future]
+            try:
+                found, err = future.result()
+            except Exception:
+                found, err = [], "lookup_failed"
+            if err and not found:
+                unresolved[pkg] = err
+            emails.update(found)
+
+    personal = {e for e in emails if _is_personal_email(e)}
+    role = {e for e in emails if _is_role_address(e)}
+    # A role address on a corporate domain is both, and the personal count is
+    # the one that would be misleading, so role wins the overlap.
+    personal -= role
+
+    print(file=sys.stderr)
+    print(_colour("  Who can publish your dependencies", _BOLD), file=sys.stderr)
+    print(f"  {len(packages):>6,}  dependencies in {manifest_path}", file=sys.stderr)
+    print(f"  {len(emails):>6,}  distinct publisher accounts can push code into them", file=sys.stderr)
+    print(f"  {len(personal):>6,}  on personal webmail (no SSO, no central revocation)", file=sys.stderr)
+    print(f"  {len(role):>6,}  role or automation addresses", file=sys.stderr)
+
+    # Never a silent zero. An unresolved package is a package whose publishers
+    # we do not know, which is not the same as a package with no publishers.
+    if unresolved:
+        print(
+            _colour(f"  {len(unresolved):>6,}  packages could NOT be resolved "
+                    f"(counted in neither line above)", _RED),
+            file=sys.stderr,
+        )
+        reasons: dict[str, int] = {}
+        for reason in unresolved.values():
+            reasons[reason] = reasons.get(reason, 0) + 1
+        for reason, count in sorted(reasons.items(), key=lambda kv: -kv[1]):
+            print(_colour(f"           {count:,} {reason}", _DIM), file=sys.stderr)
+
+    print(file=sys.stderr)
+    print(_colour("  What this count could NOT see", _BOLD), file=sys.stderr)
+    print("  This is arithmetic over public registry metadata. It reads entirely locally", file=sys.stderr)
+    print("  and sends nothing anywhere. What it cannot tell you is the part that decides", file=sys.stderr)
+    print("  whether any of it matters: whether any of those accounts is compromised right", file=sys.stderr)
+    print("  now, sitting in an infostealer log with a valid npm session alongside it.", file=sys.stderr)
+    print(f"  {DEPS_EXPOSURE_URL}", file=sys.stderr)
+    print(file=sys.stderr)
+
+    # Always 0. This is a report, not a gate: there is no threshold at which a
+    # dependency count is a build failure, and exiting non-zero would wire it
+    # into pipelines as one.
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="rsscan",
@@ -654,8 +936,31 @@ def main(argv: list[str] | None = None) -> int:
             "GitHub Actions; 'github' forces them; 'off' disables them."
         ),
     )
+    # nargs="?" with const="": `--deps` alone auto-detects the manifest in the
+    # current directory, `--deps path/to/package-lock.json` takes an explicit
+    # one. The default is None so "flag absent" stays distinguishable from
+    # "flag given with no path".
+    parser.add_argument(
+        "--deps",
+        nargs="?",
+        const="",
+        default=None,
+        metavar="MANIFEST",
+        help=(
+            "Count the publisher accounts that can push code into your npm "
+            "dependencies. Reads package-lock.json or package.json locally, "
+            "queries only registry.npmjs.org, screens nothing, names nobody, "
+            "and sends nothing to RelayShield."
+        ),
+    )
     parser.add_argument("--version", action="version", version=f"rsscan {_VERSION}")
     args = parser.parse_args(argv)
+
+    # --deps is its own mode. It reads a manifest, not a diff, so none of the
+    # secret-scanning path below applies to it and it never blocks a commit.
+    if args.deps is not None:
+        return _run_deps(args.deps, args.timeout)
+
     staged = not args.rev_range
 
     if args.strict is None:
@@ -708,8 +1013,25 @@ def main(argv: list[str] | None = None) -> int:
 
     # Opt-in org signal. Fires on clean runs too -- adoption is the signal we
     # want, and only reporting on failures would bias it toward messy repos.
-    if args.org:
-        _send_org_signal(args.org.strip().lower(), severity_counts, args.org_endpoint, args.timeout)
+    #
+    # Deliberately still opt-in as of 0.2.0. An inferred-by-default version was
+    # written and held back: a secret scanner is asking for more trust than any
+    # other tool in the toolchain, and defaulting telemetry on is the one change
+    # that would spend that trust for a metric we can live without.
+    #
+    # It announces itself on stderr when it does fire, rather than sending
+    # quietly.
+    org = (args.org or "").strip().lower()
+    if org:
+        _send_org_signal(org, severity_counts, args.org_endpoint, args.timeout)
+        print(
+            _colour(
+                f"  rsscan: reported org '{org}' with severity counts only "
+                f"(no code, no paths, no secrets).",
+                _DIM,
+            ),
+            file=sys.stderr,
+        )
 
     if not findings:
         return 0
