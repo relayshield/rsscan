@@ -35,7 +35,7 @@ commands:
     steps:
       - run:
           name: Install rsscan
-          command: python3 -m pip install --quiet --disable-pip-version-check rsscan==0.1.3
+          command: python3 -m pip install --quiet --disable-pip-version-check rsscan==0.2.0
       - run:
           name: Scan for secrets
           command: |
