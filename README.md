@@ -1,6 +1,6 @@
 # rsscan
 
-Block commits and builds that introduce API keys, tokens and other machine credentials.
+PyPI is the published version of record. Block commits and builds that introduce API keys, tokens and other machine credentials.
 
 Detects 31 credential patterns: AWS IAM keys, GitHub PATs, Stripe secrets, Slack tokens, private keys, and LLM provider keys (OpenAI, Anthropic, Google, Groq, xAI, Replicate).
 
